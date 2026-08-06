@@ -123,6 +123,20 @@ Watch for:
 - **p95 total > 15 s** → flag on DAP-114. That reopens the eager-verify
   decision, which is the whole point of measuring.
 
+## Troubleshooting
+
+**"Session died mid-add" / "mid-delete"** — fixed. The old auth guard treated
+`response.redirected` as logged-out, but UT's `page=4` and `action_code=D`
+endpoints _redirect on success_, so a working add aborted with a scary error
+after already writing the row. Mutations now report all auth signals and let
+the planner before/after diff decide the outcome. If you loaded the harness
+before this fix, re-paste it — and check View Courses for rows the aborted runs
+left behind.
+
+**Add reports 0 new rows** — either UT rejected it or the course was already
+planned. Check `add.responseSignals` in the console for what UT actually
+returned; that's also raw material for DAP-123.
+
 ## Finish
 
 ```js

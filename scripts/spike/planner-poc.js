@@ -60,14 +60,37 @@
     };
   }
 
-  /** The logged-out signal under test (DAP-123 step 5). */
+  /**
+   * Definitive logged-out evidence: UT bounced us to SSO, or served a login
+   * form. Deliberately NOT `response.redirected` — the planner's own
+   * page=4/action_code=D endpoints redirect on success, so treating any
+   * redirect as logout aborts mid-mutation (it did: "Session died mid-add"
+   * fired on a successful add).
+   *
+   * DAP-123 asks which signal is cheapest; `authSignals()` below reports all
+   * of them per response so the answer comes from data, not from this guard.
+   */
   function looksLoggedOut({ response, doc }) {
+    const sso = /\b(login|signin|idp\.utexas|shib|sso)\b/i.test(response.url);
     return (
-      response.redirected ||
-      !response.ok ||
-      /login|idp\.utexas|shib/i.test(response.url) ||
+      sso ||
+      response.status === 401 ||
+      response.status === 403 ||
       Boolean(doc.querySelector('input[type="password"]'))
     );
+  }
+
+  /** Every candidate auth signal for one response — DAP-123's raw material. */
+  function authSignals({ response, doc }) {
+    return {
+      status: response.status,
+      ok: response.ok,
+      redirected: response.redirected,
+      finalUrl: response.url,
+      ssoInUrl: /\b(login|signin|idp\.utexas|shib|sso)\b/i.test(response.url),
+      hasPasswordInput: Boolean(doc.querySelector('input[type="password"]')),
+      title: doc.title,
+    };
   }
 
   // ---------------------------------------------------------------- read path
@@ -159,10 +182,25 @@
 
   // --------------------------------------------------------------- write path
 
-  /** Follow a parsed page=4 link. State-changing — only called deliberately. */
+  /**
+   * Follow a parsed page=4 link. State-changing — only called deliberately.
+   *
+   * Never throws on a redirect: by the time this returns, UT may already have
+   * written the row, so aborting here would strand a planner row the caller
+   * doesn't know about. Whether the add worked is decided by re-reading the
+   * planner (the caller's before/after diff), not by the response shape.
+   */
   async function followAddLink(href) {
     const page = await get(new URL(href, PLANNER_LIST).toString());
-    if (looksLoggedOut(page)) throw new Error("Session died mid-add.");
+    record("add.responseSignals", authSignals(page));
+
+    if (looksLoggedOut(page)) {
+      warn(
+        "Add response looks like an SSO/login page — the row may or may not " +
+          "have been written. Check View Courses before retrying.",
+        authSignals(page),
+      );
+    }
     return page;
   }
 
@@ -190,6 +228,14 @@
 
     state.added.push(...newRows);
     log(`add produced ${newRows.length} new row(s)`, newRows);
+
+    if (!newRows.length) {
+      warn(
+        "Add wrote no new row. Either UT rejected it, or the course was " +
+          "already in the planner (see add.idempotency). Response signals:",
+        authSignals(addPage),
+      );
+    }
     return newRows[0];
   }
 
@@ -239,7 +285,9 @@
     const after = await readPlanner();
     const elapsedMs = now() - startedAt;
 
-    if (looksLoggedOut(page)) throw new Error("Session died mid-delete.");
+    // Same reasoning as followAddLink: delete redirects on success, so the
+    // planner diff decides the outcome, not the response shape.
+    record("delete.responseSignals", authSignals(page));
 
     const removed = before.length - after.length;
     const targetGone = !after.some((r) => rowKey(r) === rowKey(row));
@@ -248,7 +296,13 @@
     record("delete.elapsedMs", Math.round(elapsedMs));
     record("delete.removedExactlyOne", removed === 1);
 
-    state.added = state.added.filter((r) => rowKey(r) !== rowKey(row));
+    // Only forget the row once UT confirms it's gone — otherwise cleanup()
+    // would lose track of a row still sitting in the planner.
+    if (targetGone) {
+      state.added = state.added.filter((r) => rowKey(r) !== rowKey(row));
+    } else {
+      warn("Delete did not remove the target row:", row, authSignals(page));
+    }
     return { removed, targetGone };
   }
 
