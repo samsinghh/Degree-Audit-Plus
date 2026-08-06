@@ -10,11 +10,15 @@
  *   await poc.readPlanner()
  *   await poc.testAdd({ dept: "C S", num: "324E", ccyys: "20272" })
  *   await poc.testIdempotency({ dept: "C S", num: "324E", ccyys: "20272" })
- *   await poc.testDelete(key)
+ *   await poc.testParallelAdd([course1, course2, course3])
+ *   await poc.testDelete(row)
+ *   await poc.discoverModify()
  *   await poc.testExecutionContext()
  *   await poc.testAuthSignal()
- *   await poc.timePreview({ dept: "C S", num: "324E", ccyys: "20272" }, 5)
+ *   await poc.dumpAuditForm()   // find the Planned Courses checkbox name
+ *   await poc.timePreview(course, 5, { plannedCheckboxName: "..." })
  *   poc.report()
+ *   await poc.cleanup()
  *
  * Safety rules encoded here (from docs/hypothetical-courses-design.md):
  *   - page=4 is a state-changing GET. Never prefetched, never constructed by
@@ -269,6 +273,60 @@
     return { delta1, delta2, created };
   }
 
+  /**
+   * Do concurrent adds work, or does UT need them serialized?
+   *
+   * The design doc assumes a serial queue ("sequential, fetch-before-write and
+   * verify-after-write"). If parallel adds are safe, syncPlannerTo() could
+   * fan out instead — worth knowing before 5.2 commits to serial.
+   *
+   * Watch for: rows silently dropped (fewer new rows than courses), duplicate
+   * seq values, or interleaved seq assignment. Everything created is tracked
+   * for cleanup().
+   */
+  async function testParallelAdd(courses) {
+    if (!Array.isArray(courses) || courses.length < 2) {
+      throw new Error("Pass at least 2 courses, e.g. [{dept,num,ccyys}, ...]");
+    }
+
+    const before = await readPlanner();
+    const beforeKeys = new Set(before.map(rowKey));
+
+    // Resolve first (read-only, safe to parallelize regardless) so the writes
+    // fire as close together as possible — that's the race we're testing.
+    const links = await Promise.all(courses.map((c) => resolveAddLink(c)));
+
+    const startedAt = now();
+    const settled = await Promise.allSettled(
+      links.map(({ href }) => followAddLink(href)),
+    );
+    const elapsedMs = now() - startedAt;
+
+    const after = await readPlanner();
+    const created = after.filter((row) => !beforeKeys.has(rowKey(row)));
+    state.added.push(...created);
+
+    const seqValues = created.map((row) => row.key_course_seq);
+    const result = {
+      requested: courses.length,
+      fulfilled: settled.filter((s) => s.status === "fulfilled").length,
+      rowsCreated: created.length,
+      allLanded: created.length === courses.length,
+      duplicateSeq: seqValues.length !== new Set(seqValues).size,
+      seqValues,
+      elapsedMs: Math.round(elapsedMs),
+    };
+    record("add.parallel", result);
+
+    if (!result.allLanded) {
+      warn(
+        `parallel adds LOST rows: asked for ${courses.length}, got ` +
+          `${created.length}. UT needs serialized writes.`,
+      );
+    }
+    return result;
+  }
+
   /** DAP-122 step 2: per-row delete. Never action_code=A. */
   async function testDelete(row) {
     if (!row) throw new Error("Pass a row from readPlanner()/testAdd().");
@@ -408,64 +466,149 @@
   }
 
   /**
-   * Submit an audit with the Planned Courses checkbox set, by driving UT's own
-   * form. Returns when the submit response comes back — generation continues
-   * server-side, so the caller polls history for the new raw ID.
+   * Pick the audit form. The submit page carries several forms (site search,
+   * nav); the first one is not the audit form — that mistake is why the
+   * Planned Courses checkbox came up missing on the first run. Prefer the form
+   * that owns the run button, then fall back to the one with the most fields.
    */
-  async function submitPlannedAudit() {
+  function findAuditForm(doc) {
+    const forms = [...doc.querySelectorAll("form")];
+    if (!forms.length) throw new Error("No form on the audit submit page.");
+
+    const byRunButton = forms.find(
+      (form) =>
+        form.querySelector(".run_button") ||
+        form.querySelector('input[type="submit"], button[type="submit"]'),
+    );
+    const byFieldCount = [...forms].sort(
+      (a, b) => b.elements.length - a.elements.length,
+    )[0];
+    return byRunButton ?? byFieldCount;
+  }
+
+  /** Label text associated with a form control, however UT wired it up. */
+  function labelFor(input, form) {
+    return (
+      input.closest("label")?.textContent ??
+      (input.id
+        ? form.querySelector(`label[for="${input.id}"]`)?.textContent
+        : null) ??
+      input.closest("td")?.parentElement?.textContent ??
+      input.parentElement?.textContent ??
+      ""
+    );
+  }
+
+  /**
+   * Diagnostic: dump every form on the audit submit page with its method,
+   * action, and fields. Read-only. Run this to identify the Planned Courses
+   * checkbox by name when auto-discovery misses it.
+   */
+  async function dumpAuditForm() {
     const page = await get(NEW_AUDIT);
     if (looksLoggedOut(page)) throw new Error("Not logged in — log in first.");
 
-    const form = page.doc.querySelector("form");
-    if (!form) throw new Error("No audit form on the submit page.");
+    const forms = [...page.doc.querySelectorAll("form")].map((form, index) => ({
+      index,
+      method: (form.getAttribute("method") || "GET").toUpperCase(),
+      action: form.getAttribute("action"),
+      fieldCount: form.elements.length,
+      fields: [...form.elements].map((el) => ({
+        name: el.name,
+        type: el.type,
+        value: el.value,
+        checked: el.checked,
+        label: labelFor(el, form).replace(/\s+/g, " ").trim().slice(0, 80),
+      })),
+    }));
 
-    const body = new URLSearchParams();
+    console.log(JSON.stringify(forms, null, 2));
+    record("submit.formDump", forms);
+    log(
+      "Find the Planned Courses checkbox above, then pass its name:\n" +
+        '  await poc.timePreview(course, 5, { plannedCheckboxName: "THE_NAME" })',
+    );
+    return forms;
+  }
+
+  /**
+   * Submit an audit with the Planned Courses checkbox set, by driving UT's own
+   * form. Returns when the submit response comes back — generation continues
+   * server-side, so the caller polls history for the new raw ID.
+   *
+   * UT's audit form is a GET form, so params ride in the query string; sending
+   * them as a body throws "Request with GET/HEAD method cannot have body".
+   */
+  async function submitPlannedAudit({ plannedCheckboxName } = {}) {
+    const page = await get(NEW_AUDIT);
+    if (looksLoggedOut(page)) throw new Error("Not logged in — log in first.");
+
+    const form = findAuditForm(page.doc);
+    const method = (form.getAttribute("method") || "GET").toUpperCase();
+
+    const params = new URLSearchParams();
     for (const el of form.elements) {
       if (!el.name || el.disabled) continue;
       if (el.type === "checkbox" || el.type === "radio") {
-        if (el.checked) body.append(el.name, el.value || "on");
+        if (el.checked) params.append(el.name, el.value || "on");
         continue;
       }
-      if (el.type === "submit") continue;
-      body.append(el.name, el.value ?? "");
+      if (el.type === "submit" || el.type === "button") continue;
+      params.append(el.name, el.value ?? "");
     }
 
     // The Planned Courses checkbox is unchecked by default; our runs must
-    // always set it. Find it by label text rather than a guessed name.
-    const plannedInput = [
-      ...form.querySelectorAll('input[type="checkbox"]'),
-    ].find((input) => {
-      const label =
-        input.closest("label")?.textContent ??
-        form.querySelector(`label[for="${input.id}"]`)?.textContent ??
-        input.parentElement?.textContent ??
-        "";
-      return /planned/i.test(label);
-    });
+    // always set it. An explicit name wins; otherwise match on label text.
+    const checkboxes = [...form.querySelectorAll('input[type="checkbox"]')];
+    const plannedInput = plannedCheckboxName
+      ? checkboxes.find((input) => input.name === plannedCheckboxName)
+      : checkboxes.find((input) => /planned/i.test(labelFor(input, form)));
 
     if (!plannedInput) {
-      warn("Could not find the Planned Courses checkbox — inspect the form.");
       record("submit.plannedCheckboxFound", false);
-    } else {
-      record("submit.plannedCheckboxFound", true);
-      record("submit.plannedCheckboxName", plannedInput.name);
-      body.set(plannedInput.name, plannedInput.value || "on");
+      record(
+        "submit.checkboxCandidates",
+        checkboxes.map((input) => ({
+          name: input.name,
+          value: input.value,
+          label: labelFor(input, form).replace(/\s+/g, " ").trim().slice(0, 80),
+        })),
+      );
+      // Without the checkbox the run excludes planned courses, so the timing
+      // would measure the wrong thing entirely. Refuse rather than mislead.
+      throw new Error(
+        "Planned Courses checkbox not found — run `await poc.dumpAuditForm()`, " +
+          "then pass { plannedCheckboxName } to timePreview().",
+      );
     }
 
-    const action = new URL(
-      form.getAttribute("action") || NEW_AUDIT,
-      NEW_AUDIT,
-    ).toString();
+    record("submit.plannedCheckboxFound", true);
+    record("submit.plannedCheckboxName", plannedInput.name);
+    record("submit.formMethod", method);
+    params.set(plannedInput.name, plannedInput.value || "on");
+
+    const action = new URL(form.getAttribute("action") || NEW_AUDIT, NEW_AUDIT);
 
     const startedAt = now();
-    const response = await fetch(action, {
-      method: (form.getAttribute("method") || "POST").toUpperCase(),
-      credentials: "include",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body,
-    });
+    let response;
+    if (method === "GET") {
+      action.search = params.toString();
+      response = await fetch(action.toString(), { credentials: "include" });
+    } else {
+      response = await fetch(action.toString(), {
+        method,
+        credentials: "include",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: params,
+      });
+    }
     await response.text();
-    return { elapsedMs: now() - startedAt, status: response.status };
+    return {
+      elapsedMs: now() - startedAt,
+      status: response.status,
+      method,
+      submittedUrl: response.url,
+    };
   }
 
   /** Poll raw history until an ID appears that wasn't in `before`. */
@@ -499,7 +642,7 @@
    * planned-inclusive audit, polls for the new raw ID, scrapes it, then
    * deletes the course again so the planner is left as found.
    */
-  async function timeOnePreview(course) {
+  async function timeOnePreview(course, { plannedCheckboxName } = {}) {
     const t = {};
     const total = now();
 
@@ -508,76 +651,92 @@
     // same course, which the ticket explicitly forbids.
     const before = await readPlanner();
     const beforeKeys = new Set(before.map(rowKey));
+    let created = [];
 
-    const resolveStart = now();
-    const { href } = await resolveAddLink(course);
-    t.resolveMs = now() - resolveStart;
+    try {
+      const resolveStart = now();
+      const { href } = await resolveAddLink(course);
+      t.resolveMs = now() - resolveStart;
 
-    const addStart = now();
-    await followAddLink(href);
-    const rows = await readPlanner();
-    t.addMs = now() - addStart;
+      const addStart = now();
+      await followAddLink(href);
+      const rows = await readPlanner();
+      t.addMs = now() - addStart;
 
-    const created = rows.filter((row) => !beforeKeys.has(rowKey(row)));
-    if (created.length !== 1) {
-      warn(
-        `expected exactly 1 new row, got ${created.length} — not auto-deleting`,
-        created,
-      );
-    }
-
-    const beforeIds = (await rawHistoryIds()).ids;
-
-    const submit = await submitPlannedAudit();
-    t.submitMs = submit.elapsedMs;
-
-    const polled = await pollForNewAuditId(beforeIds);
-    t.generateMs = polled.elapsedMs;
-
-    const scraped = await scrapeAudit(polled.auditId);
-    t.scrapeMs = scraped.elapsedMs;
-
-    // Clean up: remove exactly the row this run created (identified by the
-    // before/after diff above, never by course-number matching).
-    if (created.length === 1) {
-      const added = created[0];
-      const deleteStart = now();
-      await get(
-        `${PLANNER_VIEW}?key_course_id=${encodeURIComponent(added.key_course_id)}` +
-          `&key_course_ccyys=${encodeURIComponent(added.key_course_ccyys)}` +
-          `&key_course_seq=${encodeURIComponent(added.key_course_seq)}` +
-          `&action_code=D`,
-      );
-      t.deleteMs = now() - deleteStart;
-
-      const after = await readPlanner();
-      if (after.length !== before.length) {
-        warn(
-          `planner not restored: ${before.length} rows before, ${after.length} after`,
-        );
-        state.added.push(added);
-      }
-    } else {
-      // Leave the rows for cleanup() rather than guessing which to delete.
+      created = rows.filter((row) => !beforeKeys.has(rowKey(row)));
+      // Track immediately: if a later stage throws, cleanup() must still know
+      // about this row. (Before this, a submit failure leaked a row per run.)
       state.added.push(...created);
-    }
+      if (created.length !== 1) {
+        warn(`expected exactly 1 new row, got ${created.length}`, created);
+      }
 
-    t.totalMs = now() - total;
-    t.auditId = polled.auditId;
-    t.requirementRows = scraped.requirementRows;
-    state.timings.push(t);
-    log("round trip", t);
-    return t;
+      const beforeIds = (await rawHistoryIds()).ids;
+
+      const submit = await submitPlannedAudit({ plannedCheckboxName });
+      t.submitMs = submit.elapsedMs;
+
+      const polled = await pollForNewAuditId(beforeIds);
+      t.generateMs = polled.elapsedMs;
+
+      const scraped = await scrapeAudit(polled.auditId);
+      t.scrapeMs = scraped.elapsedMs;
+
+      t.auditId = polled.auditId;
+      t.requirementRows = scraped.requirementRows;
+      t.totalMs = now() - total;
+      state.timings.push(t);
+      log("round trip", t);
+      return t;
+    } finally {
+      // Always undo this run's planner write, however the round trip ended.
+      // A failed run that leaves rows behind poisons every later measurement
+      // and the planner itself.
+      if (created.length === 1) {
+        const added = created[0];
+        const deleteStart = now();
+        try {
+          await get(
+            `${PLANNER_VIEW}?key_course_id=${encodeURIComponent(added.key_course_id)}` +
+              `&key_course_ccyys=${encodeURIComponent(added.key_course_ccyys)}` +
+              `&key_course_seq=${encodeURIComponent(added.key_course_seq)}` +
+              `&action_code=D`,
+          );
+          t.deleteMs = now() - deleteStart;
+
+          const after = await readPlanner();
+          if (after.some((row) => rowKey(row) === rowKey(added))) {
+            warn("planner not restored — row survived delete", added);
+          } else {
+            state.added = state.added.filter(
+              (row) => rowKey(row) !== rowKey(added),
+            );
+          }
+        } catch (error) {
+          warn("cleanup delete failed — run poc.cleanup()", error);
+        }
+      }
+    }
   }
 
   /** Run N round trips back to back and print the p50/p95 table. */
-  async function timePreview(course, runs = 5) {
+  async function timePreview(course, runs = 5, options = {}) {
+    let consecutiveFailures = 0;
     for (let i = 0; i < runs; i++) {
       log(`--- round trip ${i + 1}/${runs}`);
       try {
-        await timeOnePreview(course);
+        await timeOnePreview(course, options);
+        consecutiveFailures = 0;
       } catch (error) {
         warn(`round trip ${i + 1} failed:`, error);
+        // Every run mutates the real planner and UT's audit log. If the first
+        // two fail the same way, the rest will too — stop instead of grinding
+        // through five identical failures (that's what produced an empty
+        // timing table and a planner full of leftover rows).
+        if (++consecutiveFailures >= 2) {
+          warn(`stopping after ${consecutiveFailures} consecutive failures`);
+          break;
+        }
       }
     }
     return timingTable();
@@ -673,11 +832,13 @@
     resolveAddLink,
     testAdd,
     testIdempotency,
+    testParallelAdd,
     testDelete,
     discoverModify,
     testExecutionContext,
     testAuthSignal,
     rawHistoryIds,
+    dumpAuditForm,
     submitPlannedAudit,
     timeOnePreview,
     timePreview,
