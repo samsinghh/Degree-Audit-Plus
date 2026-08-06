@@ -23,7 +23,9 @@
  * Safety rules encoded here (from docs/hypothetical-courses-design.md):
  *   - page=4 is a state-changing GET. Never prefetched, never constructed by
  *     hand — always parsed from the page=3 listing.
- *   - action_code=A (Delete All) is never issued. Per-row deletes only.
+ *   - action_code=A (Delete All) is never issued. Per-row deletes only —
+ *     deleteAllCourses() wipes the planner via a per-row loop, so it stays
+ *     inspectable and reports which rows resisted deletion.
  *   - Every mutation is recorded in poc.state.added so cleanup() can undo it.
  */
 
@@ -289,12 +291,61 @@
       throw new Error("Pass at least 2 courses, e.g. [{dept,num,ccyys}, ...]");
     }
 
+    // A missing row after a parallel run has two possible causes: a genuine
+    // concurrency race, or UT rejecting that specific course on its own merits
+    // (restricted, already taken, closed term). Those are indistinguishable
+    // from the parallel run alone — so establish a serial baseline first and
+    // only blame concurrency for courses that DO add one at a time.
+    log("baseline: adding each course serially to see which UT accepts…");
+    const baselineBefore = await readPlanner();
+    const baselineKeys = new Set(baselineBefore.map(rowKey));
+    const addsSerially = [];
+
+    for (const course of courses) {
+      const label = `${course.dept} ${course.num}`;
+      try {
+        const { href } = await resolveAddLink(course);
+        await followAddLink(href);
+        const rows = await readPlanner();
+        const created = rows.filter((row) => !baselineKeys.has(rowKey(row)));
+        state.added.push(...created);
+
+        if (created.length) {
+          addsSerially.push(label);
+          // Undo immediately so the parallel phase starts from a clean slate.
+          for (const row of created) {
+            await testDelete(row);
+            baselineKeys.delete(rowKey(row));
+          }
+        } else {
+          warn(`${label} does not add even serially — UT rejects it`);
+        }
+      } catch (error) {
+        warn(`${label} failed to resolve/add serially:`, error.message);
+      }
+    }
+    record("add.serialBaseline", addsSerially);
+
+    if (addsSerially.length < 2) {
+      throw new Error(
+        `Only ${addsSerially.length} of ${courses.length} courses add at all ` +
+          `(${addsSerially.join(", ") || "none"}). Need >= 2 addable courses ` +
+          "to test concurrency — pick different courses.",
+      );
+    }
+
+    // Now the real test, restricted to courses proven to add serially.
+    const testable = courses.filter((course) =>
+      addsSerially.includes(`${course.dept} ${course.num}`),
+    );
+    log(`parallel phase: ${testable.length} course(s) known-addable`);
+
     const before = await readPlanner();
     const beforeKeys = new Set(before.map(rowKey));
 
     // Resolve first (read-only, safe to parallelize regardless) so the writes
     // fire as close together as possible — that's the race we're testing.
-    const links = await Promise.all(courses.map((c) => resolveAddLink(c)));
+    const links = await Promise.all(testable.map((c) => resolveAddLink(c)));
 
     const startedAt = now();
     const settled = await Promise.allSettled(
@@ -308,10 +359,11 @@
 
     const seqValues = created.map((row) => row.key_course_seq);
     const result = {
-      requested: courses.length,
+      requested: testable.length,
+      requestedCourses: testable.map((c) => `${c.dept} ${c.num}`),
       fulfilled: settled.filter((s) => s.status === "fulfilled").length,
       rowsCreated: created.length,
-      allLanded: created.length === courses.length,
+      allLanded: created.length === testable.length,
       duplicateSeq: seqValues.length !== new Set(seqValues).size,
       seqValues,
       elapsedMs: Math.round(elapsedMs),
@@ -320,8 +372,16 @@
 
     if (!result.allLanded) {
       warn(
-        `parallel adds LOST rows: asked for ${courses.length}, got ` +
-          `${created.length}. UT needs serialized writes.`,
+        `CONCURRENCY RACE: ${testable.length} courses that each add fine ` +
+          `serially produced only ${created.length} rows in parallel. ` +
+          "Planner writes must be serialized.",
+      );
+    } else if (result.duplicateSeq) {
+      warn("Rows landed but seq values collided — writes must be serialized.");
+    } else {
+      log(
+        `All ${created.length} parallel adds landed with distinct seq values. ` +
+          "Re-run a couple of times before trusting this — races are flaky.",
       );
     }
     return result;
@@ -475,15 +535,38 @@
     const forms = [...doc.querySelectorAll("form")];
     if (!forms.length) throw new Error("No form on the audit submit page.");
 
-    const byRunButton = forms.find(
-      (form) =>
-        form.querySelector(".run_button") ||
-        form.querySelector('input[type="submit"], button[type="submit"]'),
+    // Identify by contents, not by "has a submit button" — UT's site search
+    // form also has one, and it sorts first. (That mistake produced
+    // `checkboxCandidates: []`: the search form has no checkboxes at all.)
+    //
+    // The real audit form, confirmed 2026-08-05, carries a checkbox named
+    // `planned` and a submit named `audit`. A sibling "test profile" form
+    // shares some field names but has NO checkboxes, so requiring the
+    // checkbox distinguishes them.
+    const byPlannedCheckbox = forms.find((form) =>
+      form.querySelector('input[type="checkbox"][name="planned"]'),
     );
-    const byFieldCount = [...forms].sort(
-      (a, b) => b.elements.length - a.elements.length,
+    if (byPlannedCheckbox) return byPlannedCheckbox;
+
+    const byAuditSubmit = forms.find((form) =>
+      form.querySelector('[name="audit"][type="submit"]'),
+    );
+    if (byAuditSubmit) return byAuditSubmit;
+
+    // Last resort: the form with the most checkboxes, since the audit form is
+    // the only one on the page offering include-options.
+    const byCheckboxCount = [...forms].sort(
+      (a, b) =>
+        b.querySelectorAll('input[type="checkbox"]').length -
+        a.querySelectorAll('input[type="checkbox"]').length,
     )[0];
-    return byRunButton ?? byFieldCount;
+    if (byCheckboxCount?.querySelector('input[type="checkbox"]')) {
+      return byCheckboxCount;
+    }
+    throw new Error(
+      "Could not identify the audit form — run poc.dumpAuditForm() and check " +
+        "whether UT changed the page.",
+    );
   }
 
   /** Label text associated with a form control, however UT wired it up. */
@@ -536,10 +619,12 @@
    * form. Returns when the submit response comes back — generation continues
    * server-side, so the caller polls history for the new raw ID.
    *
-   * UT's audit form is a GET form, so params ride in the query string; sending
-   * them as a body throws "Request with GET/HEAD method cannot have body".
+   * Form shape confirmed 2026-08-05: POST, `action=""` (posts to itself),
+   * Django CSRF token in `csrfmiddlewaretoken`, include-options as checkboxes
+   * named `current` / `future` / `planned` (all value `X`), submit named
+   * `audit`. A GET with these params does nothing.
    */
-  async function submitPlannedAudit({ plannedCheckboxName } = {}) {
+  async function submitPlannedAudit({ plannedCheckboxName = "planned" } = {}) {
     const page = await get(NEW_AUDIT);
     if (looksLoggedOut(page)) throw new Error("Not logged in — log in first.");
 
@@ -553,16 +638,23 @@
         if (el.checked) params.append(el.name, el.value || "on");
         continue;
       }
-      if (el.type === "submit" || el.type === "button") continue;
+      // Named submit buttons are how Django tells which action fired, so the
+      // form's own submit must be included — UT's is `audit=Submit Audit`.
+      if (el.type === "submit") {
+        if (el.name) params.append(el.name, el.value ?? "");
+        continue;
+      }
+      if (el.type === "button") continue;
       params.append(el.name, el.value ?? "");
     }
 
     // The Planned Courses checkbox is unchecked by default; our runs must
-    // always set it. An explicit name wins; otherwise match on label text.
+    // always set it. Match by name first (UT calls it `planned`), then fall
+    // back to label text for resilience if UT renames it.
     const checkboxes = [...form.querySelectorAll('input[type="checkbox"]')];
-    const plannedInput = plannedCheckboxName
-      ? checkboxes.find((input) => input.name === plannedCheckboxName)
-      : checkboxes.find((input) => /planned/i.test(labelFor(input, form)));
+    const plannedInput =
+      checkboxes.find((input) => input.name === plannedCheckboxName) ??
+      checkboxes.find((input) => /planned/i.test(labelFor(input, form)));
 
     if (!plannedInput) {
       record("submit.plannedCheckboxFound", false);
@@ -585,9 +677,12 @@
     record("submit.plannedCheckboxFound", true);
     record("submit.plannedCheckboxName", plannedInput.name);
     record("submit.formMethod", method);
+    // value="X" on UT's checkboxes — send exactly that, not "on".
     params.set(plannedInput.name, plannedInput.value || "on");
 
-    const action = new URL(form.getAttribute("action") || NEW_AUDIT, NEW_AUDIT);
+    // action="" means "post to this same URL", which `new URL("", base)`
+    // already resolves correctly.
+    const action = new URL(form.getAttribute("action") || "", NEW_AUDIT);
 
     const startedAt = now();
     let response;
@@ -595,14 +690,31 @@
       action.search = params.toString();
       response = await fetch(action.toString(), { credentials: "include" });
     } else {
+      // Django checks the CSRF token in a header as well as the body, and
+      // rejects POSTs whose Referer doesn't match over HTTPS.
+      const csrf = params.get("csrfmiddlewaretoken");
       response = await fetch(action.toString(), {
         method,
         credentials: "include",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          ...(csrf ? { "X-CSRFToken": csrf } : {}),
+        },
         body: params,
       });
     }
-    await response.text();
+    const text = await response.text();
+
+    // A Django CSRF rejection comes back as 403 with an explanatory page, not
+    // as a network error — surface it instead of silently polling for an
+    // audit that was never queued.
+    if (response.status === 403 || /CSRF/i.test(text.slice(0, 2000))) {
+      record("submit.csrfRejected", true);
+      throw new Error(
+        `Audit submit rejected (${response.status}) — likely CSRF. Run this ` +
+          "from a console on the UT audit page itself so the Referer matches.",
+      );
+    }
     return {
       elapsedMs: now() - startedAt,
       status: response.status,
@@ -813,6 +925,112 @@
     return results;
   }
 
+  /**
+   * Wipe every row via per-row deletes, after snapshotting what was there.
+   *
+   * Deliberately NOT `action_code=A`. Same end state, but UT's Delete All is a
+   * single irreversible call with no record of what it removed; this loop
+   * prints a restorable snapshot first and reports exactly which rows resisted
+   * deletion. UT has no undo, so the snapshot is the only way back.
+   *
+   * Requires an explicit confirmation string so a stray paste can't fire it:
+   *   await poc.deleteAllCourses("DELETE ALL")
+   */
+  async function deleteAllCourses(confirmation) {
+    if (confirmation !== "DELETE ALL") {
+      throw new Error(
+        'Refusing: call poc.deleteAllCourses("DELETE ALL") to confirm. ' +
+          "This removes every planner row, including ones you added by hand.",
+      );
+    }
+
+    const before = await readPlanner();
+    if (!before.length) {
+      log("planner is already empty");
+      return { deleted: [], failed: [], snapshot: [] };
+    }
+
+    // Print the restore list BEFORE touching anything — if a delete misfires,
+    // this console output is the only record of what the planner held.
+    const snapshot = before.map((row) => ({
+      key_course_id: row.key_course_id,
+      key_course_ccyys: row.key_course_ccyys,
+      key_course_seq: row.key_course_seq,
+      rowText: row.rowText,
+    }));
+    warn(
+      `About to delete ${before.length} row(s). SNAPSHOT (save this to re-add ` +
+        "them — UT has no undo):",
+    );
+    console.log(JSON.stringify(snapshot, null, 2));
+    record("deleteAll.snapshot", snapshot);
+
+    const deleted = [];
+    const failed = [];
+    for (const row of before) {
+      try {
+        const { targetGone } = await testDelete(row);
+        (targetGone ? deleted : failed).push(row);
+      } catch (error) {
+        warn("delete failed for", row, error);
+        failed.push(row);
+      }
+    }
+
+    const after = await readPlanner();
+    record("deleteAll.result", {
+      requested: before.length,
+      deleted: deleted.length,
+      failed: failed.length,
+      remaining: after.length,
+    });
+    if (failed.length) {
+      warn(`${failed.length} row(s) could not be deleted:`, failed);
+    }
+    log(`delete-all done — ${deleted.length} removed, ${after.length} remain`);
+    return { deleted, failed, snapshot };
+  }
+
+  /**
+   * Re-add courses from a deleteAllCourses() snapshot. Best-effort recovery:
+   * seq numbers are UT-assigned, so restored rows get new ones, and the
+   * original term must still be open. Parses course id back into dept + number
+   * (`C S324E` → dept `C S`, num `324E`).
+   */
+  async function restoreFromSnapshot(snapshot) {
+    if (!Array.isArray(snapshot) || !snapshot.length) {
+      throw new Error("Pass the snapshot array printed by deleteAllCourses().");
+    }
+
+    const restored = [];
+    const failed = [];
+    for (const entry of snapshot) {
+      // Course numbers start at the first digit; everything before is the dept.
+      const match = entry.key_course_id.match(/^(.*?)(\d.*)$/);
+      if (!match) {
+        failed.push({ entry, reason: "could not split dept/number" });
+        continue;
+      }
+      const [, dept, num] = match;
+      try {
+        const { href } = await resolveAddLink({
+          dept: dept.trim(),
+          num,
+          ccyys: entry.key_course_ccyys,
+        });
+        await followAddLink(href);
+        restored.push(`${dept.trim()} ${num}`);
+      } catch (error) {
+        failed.push({ entry, reason: error.message });
+      }
+    }
+
+    const after = await readPlanner();
+    log(`restore: ${restored.length} re-added, ${failed.length} failed`);
+    if (failed.length) warn("could not restore:", failed);
+    return { restored, failed, rows: after };
+  }
+
   function report() {
     log("=== DAP-115 findings ===");
     console.log(JSON.stringify(state.findings, null, 2));
@@ -844,6 +1062,8 @@
     timePreview,
     timingTable,
     cleanup,
+    deleteAllCourses,
+    restoreFromSnapshot,
     report,
   };
 

@@ -49,6 +49,9 @@ for (const row of rows.filter((r) => r.key_course_id === "C S324E")) {
 await poc.readPlanner(); // confirm you're back to your real rows
 ```
 
+Prefer this targeted filter over `deleteAllCourses()` here — it keeps your real
+rows untouched instead of wiping and restoring them.
+
 Do this before any timing run — leftover rows change what the audit returns.
 
 ## DAP-122 — mostly done ✅
@@ -92,10 +95,27 @@ Also still open: add a course for an **already-closed term** — does UT reject
 it, or silently parenthesize it? (Parenthesized rows don't apply to audits, so
 5.4 must treat them as sync failures.)
 
-## Parallel adds (#8)
+## Parallel adds (#8) — first result was inconclusive
 
-You asked whether planner writes can run concurrently. The design assumes a
-serial queue; if parallel is safe, `syncPlannerTo()` could fan out instead.
+The 2026-08-05 run returned `requested: 3, rowsCreated: 2, allLanded: false`
+and the harness declared "UT needs serialized writes." **That conclusion wasn't
+sound**, and the test has been fixed.
+
+A missing row has two possible causes, and the old test couldn't tell them
+apart:
+
+1. A real concurrency race dropped a write.
+2. UT rejected that specific course on its own merits — restricted, already
+   taken, closed term. `C S 429H` had a `page=4` link but may never have been
+   addable at all.
+
+The evidence actually leaned toward **cause 2**: `duplicateSeq: false` with
+clean sequential seqs `996, 997, 998` is what orderly assignment looks like,
+not a corrupted race.
+
+The test now establishes a **serial baseline first** — it adds each course one
+at a time, notes which UT actually accepts, deletes them, and only then races
+the courses proven to be addable. Now a shortfall means concurrency, full stop.
 
 ```js
 await poc.testParallelAdd([
@@ -106,31 +126,43 @@ await poc.testParallelAdd([
 await poc.cleanup();
 ```
 
-It resolves all links first (read-only), then fires the `page=4` writes
-together. Reports whether every row landed, and whether any two rows collided
-on the same `key_course_seq`. **If `allLanded` is false or `duplicateSeq` is
-true, UT needs serialized writes** — which settles the question for 5.2.
+Read the output in two parts:
 
-## Delete All — don't automate it
+- `add.serialBaseline` — which courses UT accepts at all. If `C S 429H` is
+  missing here, it was never a concurrency problem. Swap in another course.
+- `add.parallel` — `allLanded: false` or `duplicateSeq: true` now genuinely
+  means **serialize planner writes** in 5.2.
 
-You asked about the `action_code=A` button. It's a plain GET, so yes, it would
-work mechanically — UT's own button just does
-`window.location.href = '...view_planner/?&action_code=A'` behind a
-`confirm()`.
+Races are flaky by nature, so **run it 2–3 times** before concluding parallel
+is safe. One clean pass isn't proof.
 
-The harness deliberately doesn't call it, and 5.2 shouldn't either:
+## Delete All
 
-- **It deletes your real courses too.** Your planner has `AFR305` at seq 999
-  that you didn't add through this spike. Delete All doesn't discriminate, and
-  there's no undo — UT has no restore, so a mis-fire costs you real planning
-  data.
-- The design already rules it out ("Delete All = **never automated** —
-  policy"), and the acceptance criteria require per-row user confirmation.
-- Per-row delete is proven, fast (~259 ms), and precise. `poc.cleanup()` uses
-  it, and it's what the leftover-row cleanup above relies on.
+Built as `poc.deleteAllCourses()` — but implemented as a **loop of per-row
+deletes**, not UT's `action_code=A`. Same end state, three advantages: it
+prints a restorable snapshot before touching anything, it reports exactly which
+rows resisted deletion, and it can't half-fire into an unknown state. UT has no
+undo, so that snapshot is the only way back.
 
-If you ever want it as a manual escape hatch, click UT's own button — that keeps
-the `confirm()` dialog and a human in the loop, which is the whole safeguard.
+```js
+// Requires the exact confirmation string, so a stray paste can't fire it.
+const { snapshot } = await poc.deleteAllCourses("DELETE ALL");
+```
+
+Copy the printed snapshot somewhere before continuing. To put things back:
+
+```js
+await poc.restoreFromSnapshot(snapshot);
+```
+
+Restore is **best-effort**: `key_course_seq` is UT-assigned so restored rows get
+new numbers, and a course whose term has since closed won't re-add. It reports
+what failed rather than pretending it round-tripped.
+
+> Note this doesn't change the product policy — the design doc still says
+> automated Delete All never ships to users, and the acceptance criteria still
+> require per-row confirmation. This is spike tooling for resetting your own
+> planner between runs.
 
 ## DAP-123 — what it's actually asking
 
@@ -208,27 +240,37 @@ fixed in the harness:
 2. The harness grabbed the page's _first_ `<form>`, which is site search, not
    the audit form. That's why the Planned Courses checkbox came up missing.
 
-**Step 1 — find the real form and checkbox:**
+**The form shape is now known** (from your `dumpAuditForm()` run, 2026-08-05).
+It's form index 2 of 3 on the page:
+
+| Property        | Value                                                        |
+| --------------- | ------------------------------------------------------------ |
+| Method          | **POST** (not GET)                                           |
+| Action          | `""` — posts to `student_individual/` itself                 |
+| CSRF            | `csrfmiddlewaretoken` (Django)                               |
+| Include-options | checkboxes `current` / `future` / `planned`, all `value="X"` |
+| Submit          | `name="audit"`, `value="Submit Audit"`                       |
+
+So the Planned Courses checkbox is **`name="planned"`, `value="X"`** — that's
+now the harness default. Just run:
 
 ```js
-await poc.dumpAuditForm(); // read-only; prints every form + field + label
+await poc.timePreview({ dept: "C S", num: "324E", ccyys: "20272" }, 5);
 ```
 
-Look through the output for the checkbox whose label mentions planned courses
-and note its `name`.
+No third argument needed. (The earlier attempt passed the literal placeholder
+`"THE_NAME_YOU_FOUND"` — but the real bug was mine: the form picker grabbed
+UT's _site search_ form, which has no checkboxes at all, hence
+`checkboxCandidates: []`. It now identifies the audit form by looking for the
+`planned` checkbox itself.)
 
-**Step 2 — run the timing with that name:**
+`submitPlannedAudit` still **throws rather than silently submitting without the
+checkbox**, because a run that excludes planned courses measures the wrong
+thing entirely. It also surfaces a Django CSRF rejection (403) instead of
+polling for an audit that was never queued.
 
-```js
-await poc.timePreview({ dept: "C S", num: "324E", ccyys: "20272" }, 5, {
-  plannedCheckboxName: "THE_NAME_YOU_FOUND",
-});
-```
-
-Auto-discovery may now find it unaided (the form picker is fixed) — if so, you
-can drop the third argument. Either way `submitPlannedAudit` now **throws
-rather than silently submitting without the checkbox**, because a run that
-excludes planned courses measures the wrong thing entirely.
+> Run this from a console **on the UT audit page**, not from a random tab —
+> Django checks the `Referer` on POST, and a mismatch is rejected.
 
 Five full round trips: resolve → add → submit → poll raw history for the new ID
 → scrape → delete. Prints a `console.table` of p50/p95 per stage.
