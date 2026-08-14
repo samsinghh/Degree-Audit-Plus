@@ -10,6 +10,68 @@ harness; this file is the script you follow.
 Delete `scripts/spike/` once the findings are folded into
 `docs/hypothetical-courses-design.md`.
 
+---
+
+## ✅ TODO — everything left, in order
+
+Sections below have the detail. **Step 2 is the only thing DAP-115 is blocked
+on**; 3–5 are follow-ups.
+
+Load the harness first (paste `planner-poc.js` into a DevTools console **on a
+UT audit page** — Django checks `Referer` on the audit POST).
+
+**1. Clean up leftovers** (~1 min) — you're at 4 rows with stale `C S324E`
+entries. Stale rows change what the audit returns, so do this before timing.
+
+```js
+const rows = await poc.readPlanner();
+for (const row of rows.filter((r) => r.key_course_id === "C S324E")) {
+  await poc.testDelete(row);
+}
+await poc.readPlanner(); // expect only AFR305 + C S331
+```
+
+**2. Run the timing** (~5 min) — ⭐ **the actual deliverable.** No extra
+arguments; the form shape is known now.
+
+```js
+await poc.timePreview({ dept: "C S", num: "324E", ccyys: "20272" }, 5);
+```
+
+Creates 5 real audits in your UT history. Copy the printed table. **If p95
+total > 15 s, flag DAP-114** — that reopens the eager-verify decision.
+
+**3. Re-run parallel adds** (~3 min) — the previous verdict was unsound; the
+test now runs a serial baseline first. Run it 2–3 times, since races are flaky.
+
+```js
+await poc.testParallelAdd([
+  { dept: "C S", num: "324E", ccyys: "20272" },
+  { dept: "C S", num: "331", ccyys: "20272" },
+  { dept: "C S", num: "429H", ccyys: "20272" },
+]);
+await poc.cleanup();
+```
+
+**4. Follow the Modify URL** (~5 min) — manual, no harness. Open the URL from
+[DAP-122](#dap-122--mostly-done-) in a tab, change term or pass/fail, submit,
+and record from the Network tab what the browser sends. DAP-129 needs this.
+
+**5. DAP-123 captures** (~10 min) — two runs the page console can't give you:
+
+- Paste the harness into the **extension service worker** console
+  (`chrome://extensions` → Degree Audit + → service worker), run
+  `await poc.testExecutionContext()`.
+- Run `await poc.testAuthSignal()` while **logged out** (incognito window).
+
+**Optional:** planner max rows, and whether a closed term is rejected or
+silently parenthesized.
+
+**Finish:** `poc.report()`, then `await poc.cleanup()`, then post the timing
+table on DAP-115 and check off `docs/hypothetical-courses-design.md`.
+
+---
+
 ## Before you start
 
 - Log in at <https://utdirect.utexas.edu/apps/degree/audits/>.
