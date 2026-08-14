@@ -17,19 +17,43 @@ Delete `scripts/spike/` once the findings are folded into
 Sections below have the detail. **Step 2 is the only thing DAP-115 is blocked
 on**; 3–5 are follow-ups.
 
-Load the harness first (paste `planner-poc.js` into a DevTools console **on a
-UT audit page** — Django checks `Referer` on the audit POST).
+**0. Get a session** — in a fresh browser you have none. Log in at
+<https://utdirect.utexas.edu/apps/degree/audits/> (SSO + Duo), then paste
+`planner-poc.js` into a DevTools console **on that UT page**. Django checks
+`Referer` on the audit POST, so a random tab won't do.
 
-**1. Clean up leftovers** (~1 min) — you're at 4 rows with stale `C S324E`
-entries. Stale rows change what the audit returns, so do this before timing.
+If `readPlanner()` throws "Not logged in", the session didn't take — re-auth
+and reload before continuing.
+
+**1. Take stock of the planner** (~1 min).
+
+> A new browser gives you a fresh *session*, not a fresh *planner*. The planner
+> lives on UT's server as one global list per student, so any rows left by
+> earlier runs are still there. Look before deleting.
 
 ```js
-const rows = await poc.readPlanner();
-for (const row of rows.filter((r) => r.key_course_id === "C S324E")) {
-  await poc.testDelete(row);
-}
-await poc.readPlanner(); // expect only AFR305 + C S331
+await poc.readPlanner(); // what does UT actually have right now?
 ```
+
+Then decide from the output:
+
+- **Only your real courses** (e.g. `AFR305`, `C S331`) → nothing to do, go to
+  step 2.
+- **Leftover spike rows** — duplicate `C S324E` entries from the failed timing
+  runs. Delete the extras, but keep any course you actually plan to take:
+
+  ```js
+  const rows = await poc.readPlanner();
+  // Inspect first, delete second. `rows` shows rowText so you can eyeball it.
+  for (const row of rows.filter((r) => r.key_course_id === "C S324E")) {
+    await poc.testDelete(row);
+  }
+  ```
+
+  If `C S324E` is a course you genuinely want planned, keep one row and delete
+  only the duplicates (`rows.filter(...).slice(1)`).
+
+Stale rows change what the audit returns, so get this right before timing.
 
 **2. Run the timing** (~5 min) — ⭐ **the actual deliverable.** No extra
 arguments; the form shape is known now.
