@@ -178,15 +178,17 @@ before/after planner screenshots, and delete `scripts/spike/`.
 
 ---
 
-## Before you start
+> Everything below is **reference** — the mechanics behind each step, and what
+> earlier runs already established. The checklist above is what to actually do.
 
-- Log in at <https://utdirect.utexas.edu/apps/degree/audits/>.
-- **Screenshot the planner as-is** (View Courses). You need a before/after pair
-  as proof, and you need to know which rows were already yours.
+## Ground rules
+
+- **Screenshot the planner as-is** (View Courses) before you start. You need a
+  before/after pair as proof.
 - Pick a throwaway course you don't mind appearing in UT's planner log — the
   planner is one global list per student and UT logs every change. Use a course
   you'd never actually plan, in the next semester's `ccyys` (e.g. `20272`).
-- Note: `page=4` (add) and `action_code=D` (delete) are **state-changing GETs**.
+- `page=4` (add) and `action_code=D` (delete) are **state-changing GETs**.
   Don't re-run cells casually and don't let DevTools replay requests.
 
 ## Load the harness
@@ -200,27 +202,17 @@ await poc.readPlanner(); // sanity check: prints existing rows + their keys
 
 If that throws "Not logged in", your session is dead — re-auth and reload.
 
-## ⚠️ First: clean up the leftover rows
+## Why leftover rows matter
 
-The 2026-08-05 run left roughly seven `C S324E` rows in the planner — each
-failed timing round trip added one and then died before its cleanup. That leak
-is fixed (cleanup now runs in a `finally`), but the existing rows are still
-there. Re-paste the harness, then:
+Earlier timing runs each added a row and died before deleting it, leaving
+duplicate `C S324E` entries. That leak is fixed — cleanup now runs in a
+`finally` — but rows written before the fix are still on UT's server, since the
+planner is server-side and a new browser doesn't reset it.
 
-```js
-const rows = await poc.readPlanner();
-// Delete ONLY the C S324E rows this spike created. AFR305 (seq 999) and
-// C S331 are yours — leave them.
-for (const row of rows.filter((r) => r.key_course_id === "C S324E")) {
-  await poc.testDelete(row);
-}
-await poc.readPlanner(); // confirm you're back to your real rows
-```
-
-Prefer this targeted filter over `deleteAllCourses()` here — it keeps your real
-rows untouched instead of wiping and restoring them.
-
-Do this before any timing run — leftover rows change what the audit returns.
+Leftover rows change what a planned-inclusive audit returns, which is why step 1
+above says look before you measure. Prefer a targeted filter over
+`deleteAllCourses()`: it leaves your real rows untouched instead of wiping and
+restoring them.
 
 ## DAP-122 — mostly done ✅
 
@@ -468,28 +460,18 @@ left behind.
 planned. Check `add.responseSignals` in the console for what UT actually
 returned; that's also raw material for DAP-123.
 
-**"Request with GET/HEAD method cannot have body"** — fixed. UT's audit form is
-a GET form; the harness was sending a POST body. See DAP-124 above.
+**"Request with GET/HEAD method cannot have body"** — fixed. The harness had
+the method backwards: UT's audit form is **POST**, and it was building a GET.
 
-**"Planned Courses checkbox not found"** — run `await poc.dumpAuditForm()` and
-pass the name explicitly. The harness now refuses to submit without it rather
-than quietly measuring a non-planned audit.
+**"Planned Courses checkbox not found"** — the harness picked the wrong form.
+Fixed: it now identifies the audit form by the `planned` checkbox itself. If it
+recurs, UT changed the page — run `await poc.dumpAuditForm()` and pass
+`{ plannedCheckboxName: "..." }` to `timePreview()`.
+
+**"Audit submit rejected (403) — likely CSRF"** — you're running from a console
+that isn't on a UT page. Django checks `Referer` on POST. Open a
+`utdirect.utexas.edu` audit page and paste the harness there.
 
 **Rows piling up after failed timing runs** — fixed. Cleanup now runs in a
-`finally`, so a failure mid-round-trip still deletes that run's row. Rows from
-before the fix must be removed manually (see the top of this file).
-
-## Finish
-
-```js
-poc.report(); // full findings JSON + timing table
-await poc.cleanup(); // must leave the planner exactly as you found it
-```
-
-Then:
-
-1. Paste the timing table + findings as a comment on DAP-115.
-2. Check off the boxes in `docs/hypothetical-courses-design.md`
-   § "Remaining unknowns" with the real answers.
-3. Attach the before/after planner screenshots to the ticket.
-4. Delete `scripts/spike/`.
+`finally`, so a failure mid-round-trip still deletes that run's row. Rows
+written before the fix must be removed manually (step 1 of the checklist).
