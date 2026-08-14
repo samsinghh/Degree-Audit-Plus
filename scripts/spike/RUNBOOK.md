@@ -17,7 +17,9 @@ Delete `scripts/spike/` once the findings are folded into
 Sections below have the detail. **Step 2 is the only thing DAP-115 is blocked
 on**; 3–5 are follow-ups.
 
-**0. Get a session** — in a fresh browser you have none. Log in at
+### 0. Get a session
+
+In a fresh browser you have none. Log in at
 <https://utdirect.utexas.edu/apps/degree/audits/> (SSO + Duo), then paste
 `planner-poc.js` into a DevTools console **on that UT page**. Django checks
 `Referer` on the audit POST, so a random tab won't do.
@@ -25,9 +27,9 @@ on**; 3–5 are follow-ups.
 If `readPlanner()` throws "Not logged in", the session didn't take — re-auth
 and reload before continuing.
 
-**1. Take stock of the planner** (~1 min).
+### 1. Take stock of the planner (~1 min)
 
-> A new browser gives you a fresh *session*, not a fresh *planner*. The planner
+> A new browser gives you a fresh _session_, not a fresh _planner_. The planner
 > lives on UT's server as one global list per student, so any rows left by
 > earlier runs are still there. Look before deleting.
 
@@ -55,18 +57,42 @@ Then decide from the output:
 
 Stale rows change what the audit returns, so get this right before timing.
 
-**2. Run the timing** (~5 min) — ⭐ **the actual deliverable.** No extra
-arguments; the form shape is known now.
+### 2. Run the timing ⭐ (~5 min) — this is the deliverable
+
+**Run:**
 
 ```js
 await poc.timePreview({ dept: "C S", num: "324E", ccyys: "20272" }, 5);
 ```
 
-Creates 5 real audits in your UT history. Copy the printed table. **If p95
-total > 15 s, flag DAP-114** — that reopens the eager-verify decision.
+No extra arguments — the form shape is known now. This creates **5 real audits**
+in your UT history and adds/deletes one planner row per run.
 
-**3. Re-run parallel adds** (~3 min) — the previous verdict was unsound; the
-test now runs a serial baseline first. Run it 2–3 times, since races are flaky.
+**Expect:** five `--- round trip N/5` blocks, each logging
+`round trip {resolveMs, addMs, submitMs, generateMs, scrapeMs, deleteMs,
+totalMs, auditId}`, then a `console.table` at the end.
+
+**Record:** right-click the table → Copy, or run `poc.timingTable()` again. You
+want the p50/p95 row per stage.
+
+**Judge it:**
+
+| Result               | Meaning                                                  |
+| -------------------- | -------------------------------------------------------- |
+| p95 `totalMs` < 15 s | ✅ Eager-verify holds. Ticket's core question answered.  |
+| p95 `totalMs` > 15 s | 🚩 **Flag DAP-114** — reopens the eager-verify decision  |
+| Table prints `{}`    | Every run failed; read the error and see Troubleshooting |
+
+**If it fails:** the error names the stage. `Planned Courses checkbox not found`
+→ run `await poc.dumpAuditForm()`. A 403/CSRF → you're not on a UT page. The
+harness stops after 2 consecutive failures rather than burning all five.
+
+### 3. Re-run parallel adds (~3 min)
+
+The earlier verdict was unsound (it couldn't tell a race from UT rejecting a
+course). The test now runs a serial baseline first.
+
+**Run — 2 or 3 times, since races are flaky:**
 
 ```js
 await poc.testParallelAdd([
@@ -74,25 +100,81 @@ await poc.testParallelAdd([
   { dept: "C S", num: "331", ccyys: "20272" },
   { dept: "C S", num: "429H", ccyys: "20272" },
 ]);
-await poc.cleanup();
+await poc.cleanup(); // between each run
 ```
 
-**4. Follow the Modify URL** (~5 min) — manual, no harness. Open the URL from
-[DAP-122](#dap-122--mostly-done-) in a tab, change term or pass/fail, submit,
-and record from the Network tab what the browser sends. DAP-129 needs this.
+**Read two findings in the output:**
 
-**5. DAP-123 captures** (~10 min) — two runs the page console can't give you:
+- `add.serialBaseline` — which courses UT accepts one at a time. A course
+  missing here was never a concurrency problem; swap in a different one.
+- `add.parallel` — the verdict:
 
-- Paste the harness into the **extension service worker** console
-  (`chrome://extensions` → Degree Audit + → service worker), run
-  `await poc.testExecutionContext()`.
-- Run `await poc.testAuthSignal()` while **logged out** (incognito window).
+| Output                                               | Meaning                                |
+| ---------------------------------------------------- | -------------------------------------- |
+| `allLanded: true`, `duplicateSeq: false`, repeatable | Parallel writes look safe              |
+| `allLanded: false`                                   | 🚩 **Serialize planner writes** in 5.2 |
+| `duplicateSeq: true`                                 | 🚩 Serialize — seq assignment collided |
 
-**Optional:** planner max rows, and whether a closed term is rejected or
-silently parenthesized.
+### 4. Follow the Modify URL (~5 min) — manual, no harness
 
-**Finish:** `poc.report()`, then `await poc.cleanup()`, then post the timing
-table on DAP-115 and check off `docs/hypothetical-courses-design.md`.
+**Do:** open DevTools → Network tab, then paste this into the address bar
+(swap in a `key_course_seq` from your own `readPlanner()` output):
+
+```text
+https://utdirect.utexas.edu/apps/degree/audits/planner/modify_planned_course/?key_course_id=C%20S324E&key_course_ccyys=20272&key_course_seq=996&key_course_type=1&action_code=M
+```
+
+Change the term or pass/fail, submit, and in the Network tab click the submit
+request.
+
+**Record:** its **method** (GET or POST), its **URL**, and its **form data /
+query params** (the "Payload" tab). That's the shape DAP-129 needs.
+
+### 5. DAP-123 captures (~10 min) — two contexts the page console can't give you
+
+**5a — service worker.** Run `bun run dev`, load the extension, open
+`chrome://extensions` → Degree Audit + → click **service worker**. Paste
+`planner-poc.js` there and run:
+
+```js
+await poc.testExecutionContext();
+```
+
+**Record** `cookiesRodeAlong`, `domParserAvailable`, `parsedPlannerRows`.
+Expect `domParserAvailable: false` (MV3 has no DOM) — that's fine. The question
+that matters is **`cookiesRodeAlong`**: if true, the background can fetch and
+hand parsing elsewhere, which makes 5.4's pipeline much simpler.
+
+**5b — logged out.** Open an incognito window, go to a UT audit URL **without
+logging in**, paste the harness, and run:
+
+```js
+await poc.testAuthSignal();
+```
+
+**Record** which fields differ from your logged-in run. Whichever flips most
+cheaply becomes the auth gate. This matters because `response.redirected` —
+what `session.ts` uses today — is **true on a successful planner add**, so it
+can't be the signal for writes.
+
+### Optional (only if you have time)
+
+- **Planner max rows:** `await poc.testAdd(...)` repeatedly until UT complains.
+  Bail at ~15–20 and record where you stopped rather than inventing a number.
+- **Closed term:** add a course for a past `ccyys` — rejected, or silently
+  parenthesized?
+
+### Finish
+
+```js
+poc.report(); // prints every finding collected this session
+await poc.cleanup(); // planner back to how you found it
+await poc.readPlanner(); // verify
+```
+
+Then: post the timing table on DAP-115, check off the table in
+`docs/hypothetical-courses-design.md` § "Remaining unknowns", attach
+before/after planner screenshots, and delete `scripts/spike/`.
 
 ---
 
