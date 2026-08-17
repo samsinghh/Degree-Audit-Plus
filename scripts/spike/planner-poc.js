@@ -65,7 +65,7 @@
     }
     const has = (re) => re.test(text);
     const stub = {
-      title: (text.match(/<title[^>]*>([^<]*)/i) || [, ""])[1].trim(),
+      title: (text.match(/<title[^>]*>([^<]*)/i) || [null, ""])[1].trim(),
       querySelector(sel) {
         if (/password/.test(sel)) {
           return has(/type=["']?password/i) ? {} : null;
