@@ -77,7 +77,6 @@ export function isLoginPage(document: Document): boolean {
   );
 }
 
-
 // Probe only when the session id actually changed, and never more often than this
 const COOKIE_PROBE_MIN_INTERVAL_MS = 60_000;
 

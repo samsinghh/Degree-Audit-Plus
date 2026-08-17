@@ -102,7 +102,7 @@ export default function App() {
     });
   };
 
-  // The background owns the auth checks: 
+  // The background owns the auth checks:
   const handleRerunAudit = async () => {
     setRunningAudit(true);
     try {
