@@ -77,19 +77,47 @@ export function isLoginPage(document: Document): boolean {
   );
 }
 
+
+// Probe only when the session id actually changed, and never more often than this
+const COOKIE_PROBE_MIN_INTERVAL_MS = 60_000;
+
+// Decides whether a session-cookie set event warrants a network probe.
+export function createCookieProbeGate(
+  minIntervalMs = COOKIE_PROBE_MIN_INTERVAL_MS,
+) {
+  let lastValue: string | undefined;
+  let lastProbeAt = -Infinity;
+  return {
+    shouldProbe(value: string, now: number): boolean {
+      if (value === lastValue) return false;
+      lastValue = value;
+      if (now - lastProbeAt < minIntervalMs) return false;
+      lastProbeAt = now;
+      return true;
+    },
+    reset(): void {
+      lastValue = undefined;
+    },
+  };
+}
+
 // Event-driven cache updates from the background service worker: react the
 // moment the session cookie is removed or (re)created, instead of waiting for
 // the next popup open. Requires the "cookies" permission.
 export function registerSessionCookieWatcher(): void {
   if (!browser.cookies?.onChanged) return;
 
+  const gate = createCookieProbeGate();
   browser.cookies.onChanged.addListener(({ cookie, removed, cause }) => {
     if (cookie.name !== SESSION_COOKIE) return;
     if (removed) {
       // "overwrite" removals are immediately followed by a set event for the
       // replacement cookie — not a logout.
-      if (cause !== "overwrite") void saveLoginState(false);
-    } else {
+      if (cause !== "overwrite") {
+        gate.reset();
+        void saveLoginState(false);
+      }
+    } else if (gate.shouldProbe(cookie.value, Date.now())) {
       void refreshLoginState();
     }
   });
