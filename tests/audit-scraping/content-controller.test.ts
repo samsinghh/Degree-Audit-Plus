@@ -37,10 +37,14 @@ mock.module("../../features/audit-scraping/audit-runner", () => ({
     ranAudits.push(custom);
   },
 }));
+
 mock.module("../../features/session/session", () => ({
   recordLoginStateFromPage: () => {
     recordedLoginPages++;
   },
+  getCachedLoginState: async () => true,
+  openLoginTab: async () => {},
+  registerSessionCookieWatcher: () => {},
 }));
 mock.module("../../lib/browser/messages", () => ({
   sendMessageResponse: (
@@ -48,6 +52,8 @@ mock.module("../../lib/browser/messages", () => ({
     sendResponse: (response: unknown) => void,
     response: unknown,
   ) => sendResponse(response),
+  sendRuntimeMessage: async () => undefined,
+  sendTabMessage: async () => undefined,
 }));
 
 (
