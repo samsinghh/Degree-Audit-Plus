@@ -27,6 +27,20 @@ const DegreeAuditCard: React.FC<DegreeAuditCardProps> = ({
   const [menuOpen, setMenuOpen] = React.useState(false);
   const [isEditing, setIsEditing] = React.useState(false);
   const [draftTitle, setDraftTitle] = React.useState(title ?? "");
+  const cardRef = React.useRef<HTMLDivElement>(null);
+
+  React.useEffect(() => {
+    if (!menuOpen) return;
+
+    const handleClickOutside = (event: MouseEvent) => {
+      if (cardRef.current && !cardRef.current.contains(event.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [menuOpen]);
 
   React.useEffect(() => {
     if (!isSelected) {
@@ -54,6 +68,7 @@ const DegreeAuditCard: React.FC<DegreeAuditCardProps> = ({
 
   return (
     <div
+      ref={cardRef}
       className={`relative rounded-[8px] px-4 py-[12px] w-full transition-all duration-200 cursor-pointer ${
         isSelected
           ? "bg-dap-orange border border-dap-orange"
