@@ -73,7 +73,7 @@ const architectureBoundaries = [
 ];
 
 export default defineConfig([
-  { ignores: [".output/**", ".wxt/**"] },
+  { ignores: [".output/**", ".wxt/**", "preview/dist/**"] },
   {
     files: ["**/*.{js,mjs,cjs,ts,mts,cts,jsx,tsx}"],
     plugins: { js },
